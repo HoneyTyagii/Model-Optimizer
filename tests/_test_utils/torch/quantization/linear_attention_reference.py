@@ -38,7 +38,7 @@ def state_fp8_qdq_reference(state: torch.Tensor, block_v: int = 64) -> torch.Ten
     """Dynamic E4M3 QDQ with identity STE and one scale per ``[Dk, block_v]`` tile.
 
     ``state`` is in key-first layout ``[..., Dk, Dv]``. Scales and rounding do not
-    contribute derivatives. The zero tile uses scale one; partial value tiles are valid.
+    contribute derivatives. FP8 uses TensorQuantizer small-range handling; partial tiles are valid.
     """
     return state_qdq_reference(state, block_v)
 
@@ -53,14 +53,14 @@ def state_qdq_reference(state: torch.Tensor, block_v: int = 64, state_format: st
         rounded = []
         for tile in state.float().split(block_v, dim=-1):
             amax = tile.abs().amax(dim=(-2, -1), keepdim=True)
-            limit = 127.0 if state_format == "int8" else 448.0
-            scale = torch.where(amax > 0, amax / limit, torch.ones_like(amax))
-            normalized = (tile / scale).clamp(-limit, limit)
-            codes = (
-                normalized.round()
-                if state_format == "int8"
-                else normalized.to(torch.float8_e4m3fn).float()
-            )
+            if state_format == "int8":
+                scale = torch.where(amax > 0, amax / 127.0, torch.ones_like(amax))
+                codes = (tile / scale).clamp(-127, 127).round()
+            else:
+                safe_amax = torch.where(amax <= 2**-24, torch.ones_like(amax), amax)
+                quant_scale = torch.div(448.0, safe_amax)
+                scale = quant_scale.reciprocal()
+                codes = (tile * quant_scale).clamp(-448, 448).to(torch.float8_e4m3fn).float()
             rounded.append(codes * scale)
         quantized = torch.cat(rounded, dim=-1).to(state.dtype)
     return state + (quantized - state).detach()

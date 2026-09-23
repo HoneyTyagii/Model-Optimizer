@@ -34,7 +34,7 @@ from modelopt.torch.quantization.nn import TensorQuantizer
 pytest.importorskip("fla")  # Megatron-Core GatedDeltaNet and the state QDQ kernel need fla
 GatedDeltaNet = pytest.importorskip("megatron.core.ssm.gated_delta_net").GatedDeltaNet
 
-from modelopt.torch.quantization.plugins.gated_delta_net import _state_qdq_chunk_gated_delta_rule
+from modelopt.torch.quantization.plugins.gdn import _state_qdq_chunk_gated_delta_rule
 from modelopt.torch.quantization.plugins.megatron import _QuantGatedDeltaNet
 
 try:

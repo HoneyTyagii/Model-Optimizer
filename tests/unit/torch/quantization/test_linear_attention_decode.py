@@ -18,15 +18,52 @@ import itertools
 import pytest
 import torch
 import torch.nn.functional as F
+from _test_utils.torch.quantization.linear_attention_reference import recurrent_delta_rule_reference
 
+from modelopt.torch.quantization.config import QuantizerAttributeConfig
 from modelopt.torch.quantization.linear_attention import (
     LinearAttentionConfig,
     matmul_gdn,
     matmul_kda,
 )
 from modelopt.torch.quantization.linear_attention.config import LinearAttentionDecodeConfig
-from modelopt.torch.quantization.linear_attention.decode import recurrent_decode_reference
-from _test_utils.torch.quantization.linear_attention_reference import (recurrent_delta_rule_reference)
+from modelopt.torch.quantization.linear_attention.decode import _encode, recurrent_decode_reference
+from modelopt.torch.quantization.linear_attention.utils import _state_qdq
+from modelopt.torch.quantization.nn import TensorQuantizer
+
+
+@pytest.mark.parametrize("state", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_fp8_qdq_matches_tensor_quantizer(state, dtype):
+    torch.manual_seed(762)
+    amplitudes = torch.tensor([0.0, 1e-8, 2**-24, 2**-23, 1.0, 731.173], dtype=dtype)
+    value = torch.rand((2, 6, 5, 19) if state else (2, 6, 19), dtype=dtype) * 2 - 1
+    value *= amplitudes.reshape(1, 6, *([1] * (value.ndim - 2)))
+    value.requires_grad_()
+    quantizer = TensorQuantizer(
+        QuantizerAttributeConfig(
+            num_bits=(4, 3), type="dynamic", axis=(0, 1), pass_through_bwd=True
+        )
+    )
+    expected = torch.cat(
+        [
+            quantizer(tile.flatten(-2) if state else tile).reshape_as(tile)
+            for tile in value.split(16, -1)
+        ],
+        -1,
+    )
+    encoded = _encode(value, True, 16, state=state)
+    results = [encoded.values]
+    if state:
+        results.append(_state_qdq(value, 16))
+    probe = torch.randn_like(value)
+    (expected_gradient,) = torch.autograd.grad((expected * probe).sum(), value)
+    for result in results:
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        (gradient,) = torch.autograd.grad((result * probe).sum(), value)
+        torch.testing.assert_close(gradient, expected_gradient, rtol=0, atol=0)
+    assert encoded.scales.shape == (2, 6, 2)
+    assert not encoded.scales.requires_grad
 
 
 def _inputs(kda=True, length=73):

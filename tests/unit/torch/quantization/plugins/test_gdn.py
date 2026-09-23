@@ -23,8 +23,8 @@ import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
 from modelopt.torch.quantization.config import QuantizeConfig
 from modelopt.torch.quantization.nn import QuantModuleRegistry
-from modelopt.torch.quantization.plugins import gated_delta_net
-from modelopt.torch.quantization.plugins.gated_delta_net import GatedDeltaNetStateQuantMixin
+from modelopt.torch.quantization.plugins import gdn
+from modelopt.torch.quantization.plugins.gdn import GatedDeltaNetStateQuantMixin
 
 GDN_STATE_INT8_DYNAMIC = {
     "num_bits": 8,
@@ -138,9 +138,7 @@ def test_enabled_state_quantizer_uses_state_qdq_kernel(monkeypatch, state_format
         calls.append(kwargs)
         return chunk_gated_delta_rule(*args)
 
-    monkeypatch.setattr(
-        gated_delta_net, "_state_qdq_chunk_gated_delta_rule", lambda: fake_state_qdq_kernel
-    )
+    monkeypatch.setattr(gdn, "_state_qdq_chunk_gated_delta_rule", lambda: fake_state_qdq_kernel)
     model = TinyGatedDeltaNet()
     x = torch.randn(2, 8, 3, 4)
     cfg = quant_cfg()
@@ -172,9 +170,7 @@ def test_w_quantizer_is_passed_to_the_kernel(monkeypatch, state):
         calls.append(kwargs)
         return chunk_gated_delta_rule(*args)
 
-    monkeypatch.setattr(
-        gated_delta_net, "_state_qdq_chunk_gated_delta_rule", lambda: fake_state_qdq_kernel
-    )
+    monkeypatch.setattr(gdn, "_state_qdq_chunk_gated_delta_rule", lambda: fake_state_qdq_kernel)
     model = TinyGatedDeltaNet()
     x = torch.randn(2, 8, 3, 4)
     mtq.quantize(model, quant_cfg(state=state, w=True), lambda m: m(x))

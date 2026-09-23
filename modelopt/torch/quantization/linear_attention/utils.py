@@ -15,11 +15,15 @@
 
 """Shared helpers for linear-attention quantization."""
 
+from __future__ import annotations
+
 from itertools import pairwise
+from typing import TYPE_CHECKING
 
 import torch
 
-from ..nn import TensorQuantizer
+if TYPE_CHECKING:
+    from ..nn import TensorQuantizer
 
 __all__ = []
 
@@ -31,6 +35,9 @@ def validate_gdn_quantizer(
     num_bits: tuple[int | tuple[int, int], ...] = ((4, 3),),
 ) -> None:
     """Check supported formats and the custom backward's identity STE."""
+    # Numerical helpers load while QuantizeConfig initializes; defer the quantizer import.
+    from ..nn import TensorQuantizer
+
     if not isinstance(quantizer, TensorQuantizer):
         raise ValueError(f"{name} requires a single TensorQuantizer")
     if not (
@@ -91,24 +98,45 @@ def _prepare(q, k, v, g, beta, initial_state, cu_seqlens, state_v_first):
         sequences,
     )
 
+
+def _fp8_quantize(value: torch.Tensor, axis):
+    """Apply ModelOpt FP8 QDQ and return its detached dequantization scales."""
+    # QuantizeConfig imports this module before the quantizer classes are initialized.
+    from ..config import QuantizerAttributeConfig
+    from ..nn import TensorQuantizer
+
+    quantizer = TensorQuantizer(
+        QuantizerAttributeConfig(num_bits=(4, 3), type="dynamic", axis=axis, pass_through_bwd=True)
+    )
+    quantized = quantizer(value)
+    amax = quantizer._get_amax(value).float()
+    safe_amax = torch.where(amax <= 2**-24, torch.ones_like(amax), amax)
+    return quantized, torch.div(448.0, safe_amax).reciprocal()
+
+
 def _state_qdq(state: torch.Tensor, block_v: int = 64, state_format: str = "fp8_e4m3"):
     """Dynamic state-tile QDQ with detached scales and identity STE."""
     if state_format not in ("fp8_e4m3", "int8"):
         raise ValueError("State format must be fp8_e4m3 or int8")
     if block_v not in (16, 32, 64, 128):
         raise ValueError("block_v must be 16, 32, 64, or 128")
+    if state_format == "fp8_e4m3":
+        axis = tuple(range(state.ndim - 2)) or None
+        return torch.cat(
+            [
+                _fp8_quantize(tile.flatten(-2), axis)[0].reshape_as(tile)
+                for tile in state.split(block_v, dim=-1)
+            ],
+            dim=-1,
+        )
     with torch.no_grad():
         rounded = []
         for tile in state.float().split(block_v, dim=-1):
             amax = tile.abs().amax(dim=(-2, -1), keepdim=True)
-            limit = 127.0 if state_format == "int8" else 448.0
+            limit = 127.0
             scale = torch.where(amax > 0, amax / limit, torch.ones_like(amax))
             normalized = (tile / scale).clamp(-limit, limit)
-            codes = (
-                normalized.round()
-                if state_format == "int8"
-                else normalized.to(torch.float8_e4m3fn).float()
-            )
+            codes = normalized.round()
             rounded.append(codes * scale)
         quantized = torch.cat(rounded, dim=-1).to(state.dtype)
     return state + (quantized - state).detach()

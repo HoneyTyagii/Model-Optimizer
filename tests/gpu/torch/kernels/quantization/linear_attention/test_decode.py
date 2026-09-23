@@ -19,13 +19,16 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from modelopt.torch.kernels.quantization.linear_attention.decode import _fp8_qdq, fused_recurrence
+from modelopt.torch.kernels.quantization.common.fp8_quant import fp8_dynamic_qdq
+from modelopt.torch.kernels.quantization.linear_attention.decode import fused_recurrence
+from modelopt.torch.quantization.config import QuantizerAttributeConfig
 from modelopt.torch.quantization.linear_attention.config import LinearAttentionDecodeConfig
 from modelopt.torch.quantization.linear_attention.decode import (
     _encode,
     recurrent_decode,
     recurrent_decode_reference,
 )
+from modelopt.torch.quantization.nn import TensorQuantizer
 
 
 @pytest.mark.parametrize("kda", [False, True])
@@ -153,16 +156,22 @@ def test_fused_carry_handoff_and_auxiliary_gradients(mode, interval, state_forma
 
 
 @triton.jit
-def _codec_kernel(X, Y, S, N: tl.constexpr, BLOCK: tl.constexpr):  # noqa: N803
+def _codec_kernel(X, Y, S, N: tl.constexpr, BLOCK: tl.constexpr, NATIVE_FP8: tl.constexpr):  # noqa: N803
     offsets = tl.arange(0, BLOCK)
     values = tl.load(X + offsets, offsets < N, 0)
-    decoded, scale = _fp8_qdq(values)
+    decoded, scale = fp8_dynamic_qdq(values, NATIVE_FP8)
     tl.store(Y + offsets, decoded, offsets < N)
     tl.store(S, scale)
 
 
-@pytest.mark.parametrize("scale", [0.0, 2.0**-12, 1.0, 2.0**12, 0.00314159, 731.173])
-def test_software_codec_matches_float8_boundaries(scale):
+@pytest.mark.parametrize("native_fp8", [False, True])
+@pytest.mark.parametrize(
+    "scale",
+    [0.0, 1e-8 / 448, 2.0**-24 / 448, 2.0**-23 / 448, 2.0**-12, 1.0, 2.0**12, 0.00314159, 731.173],
+)
+def test_fp8_codec_matches_tensor_quantizer_boundaries(scale, native_fp8):
+    if native_fp8 and torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("Native FP8 conversion requires SM89 or later")
     # Exhaust all finite positive E4M3 values and their rounding ties, plus signs.
     representable = torch.arange(127, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
     ties = (representable[:-1] + representable[1:]) / 2
@@ -179,11 +188,44 @@ def test_software_codec_matches_float8_boundaries(scale):
     actual = torch.empty_like(values)
     actual_scale = torch.empty((), device="cuda")
     _codec_kernel[(1,)](
-        values, actual, actual_scale, len(values), triton.next_power_of_2(len(values))
+        values,
+        actual,
+        actual_scale,
+        len(values),
+        triton.next_power_of_2(len(values)),
+        native_fp8,
     )
-    expected = _encode(values, True, len(values))
-    torch.testing.assert_close(actual, expected.values, rtol=0, atol=0)
-    torch.testing.assert_close(actual_scale, expected.scales[0], rtol=0, atol=0)
+    quantizer = TensorQuantizer(QuantizerAttributeConfig(num_bits=(4, 3), type="dynamic"))
+    torch.testing.assert_close(actual, quantizer(values), rtol=0, atol=0)
+    amax = values.abs().amax()
+    safe_amax = torch.where(amax <= 2**-24, torch.ones_like(amax), amax)
+    torch.testing.assert_close(
+        actual_scale, torch.div(448.0, safe_amax).reciprocal(), rtol=0, atol=0
+    )
+
+
+def test_fused_fp8_state_matches_tensor_quantizer_with_partial_tiles():
+    torch.manual_seed(762)
+    amplitudes = torch.tensor([0.0, 1e-8, 2**-24, 2**-23, 1.0, 731.173], device="cuda")
+    state = (torch.rand(6, 3, 19, device="cuda") * 2 - 1) * amplitudes[:, None, None]
+    state[:, 0, 0] = amplitudes
+    state.requires_grad_()
+    q = torch.zeros(1, 6, 3, device="cuda")
+    v = torch.zeros(1, 6, 19, device="cuda")
+    gate = torch.zeros(1, 6, device="cuda")
+    _, actual, *_ = fused_recurrence(q, q, v, gate, gate, state, state_qdq=True, block_v=16)
+    quantizer = TensorQuantizer(
+        QuantizerAttributeConfig(num_bits=(4, 3), type="dynamic", axis=0, pass_through_bwd=True)
+    )
+    expected = torch.cat(
+        [quantizer(tile.flatten(-2)).reshape_as(tile) for tile in state.split(16, -1)], -1
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    probe = torch.randn_like(state)
+    gradients = [
+        torch.autograd.grad((value * probe).sum(), state)[0] for value in (actual, expected)
+    ]
+    torch.testing.assert_close(*gradients, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("kda", [False, True])
@@ -268,3 +310,103 @@ def test_full_key_width_and_value_block_tail(block_v, kda, state_format):
         results.append((output, final, *gradients))
     for actual, expected in zip(*results):
         torch.testing.assert_close(actual, expected, rtol=1e-3, atol=2e-5)
+
+
+@pytest.mark.parametrize("kda", [False, True])
+@pytest.mark.parametrize(
+    ("mode", "block_v", "readout", "factor_qdq"),
+    [
+        ("token", 32, "stored", False),
+        ("replay", 64, "working", False),
+        ("replay", 128, "stored", True),
+    ],
+)
+@pytest.mark.timeout(180)
+def test_hadamard_fused_split_carry_and_gradients(kda, mode, block_v, readout, factor_qdq):
+    torch.manual_seed(917)
+    q, k = [
+        F.normalize(torch.randn(37, 2, 17, device="cuda"), dim=-1).requires_grad_()
+        for _ in range(2)
+    ]
+    v = torch.randn(37, 2, 96, device="cuda", requires_grad=True)
+    g = (-torch.rand(q.shape if kda else q.shape[:-1], device="cuda") * 0.03).requires_grad_()
+    beta = (torch.rand(37, 2, device="cuda") * 0.4).requires_grad_()
+    initial = (torch.randn(2, 17, 96, device="cuda") * 0.1).requires_grad_()
+    args = (q, k, v, g, beta)
+    cfg = LinearAttentionDecodeConfig(
+        mode=mode,
+        readout=readout,
+        state_codec="int8_hadamard32",
+        decay_log_step=1 / 256,
+        replay={"window": 8, "factor_qdq": factor_qdq} if mode == "replay" else None,
+    )
+    shared = {"state_qdq": True, "state_format": "int8", "block_v": block_v}
+    expected, ref_carry = recurrent_decode_reference(
+        *args, config=cfg, initial_state=initial, **shared
+    )
+    carry, start, pieces = None, 0, []
+    for end in (0, 2, 8, 8, 19, 37):
+        output, carry = recurrent_decode(
+            *(x[start:end] for x in args),
+            config=cfg.model_copy(update={"implementation": "triton"}),
+            initial_state=initial if carry is None else None,
+            carry=carry,
+            **shared,
+        )
+        pieces.append(output)
+        start = end
+    actual = torch.cat(pieces)
+    assert carry.value_basis == "hadamard32" and carry.cursor == ref_carry.cursor
+    assert carry.anchor.scales.shape == (2, 17, 3) and carry.anchor.scales.dtype == torch.float16
+    torch.testing.assert_close(carry.anchor.scales, ref_carry.anchor.scales, rtol=0, atol=0)
+    actual_tensors = (
+        actual,
+        carry.reconstruct(),
+        carry.anchor.values,
+        *(e.update.values for e in carry.entries),
+    )
+    expected_tensors = (
+        expected,
+        ref_carry.reconstruct(),
+        ref_carry.anchor.values,
+        *(e.update.values for e in ref_carry.entries),
+    )
+    probes = [torch.randn_like(x) for x in expected_tensors]
+    gradients = [
+        torch.autograd.grad(sum((x * p).sum() for x, p in zip(result, probes)), (*args, initial))
+        for result in (actual_tensors, expected_tensors)
+    ]
+    for a, e in zip((*actual_tensors, *gradients[0]), (*expected_tensors, *gradients[1])):
+        torch.testing.assert_close(a, e, rtol=1e-3, atol=1e-5)
+
+
+@pytest.mark.parametrize("kda", [False, True])
+@pytest.mark.timeout(180)
+def test_hadamard_long_trajectory(kda):
+    torch.manual_seed(991)
+    q, k = [
+        F.normalize(torch.randn(257, 1, 128, device="cuda"), dim=-1).requires_grad_()
+        for _ in range(2)
+    ]
+    v = torch.randn(257, 1, 64, device="cuda", requires_grad=True)
+    g = (-torch.rand(q.shape if kda else q.shape[:-1], device="cuda") * 1e-4).requires_grad_()
+    beta = (torch.rand(257, 1, device="cuda") * 0.1).requires_grad_()
+    initial = (torch.randn(1, 128, 64, device="cuda") * 0.1).requires_grad_()
+    args = (q, k, v, g, beta)
+    results = []
+    for implementation in ("torch", "triton"):
+        cfg = LinearAttentionDecodeConfig(
+            mode="replay",
+            implementation=implementation,
+            state_codec="int8_hadamard32",
+            replay={"window": 8, "factor_qdq": False},
+        )
+        out, carry = recurrent_decode(
+            *args, config=cfg, initial_state=initial, state_qdq=True, state_format="int8"
+        )
+        final = carry.reconstruct()
+        grads = torch.autograd.grad(out.square().sum() + final.square().sum(), (*args, initial))
+        results.append((out, final, *grads))
+    for a, e in zip(*results):
+        assert torch.isfinite(a).all() and torch.isfinite(e).all()
+        assert (a - e).norm() / e.norm().clamp_min(1e-8) < 1e-4

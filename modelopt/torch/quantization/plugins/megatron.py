@@ -61,7 +61,7 @@ from ..qtensor import QTensorWrapper
 from ..utils import sync_moe_expert_amax
 from ..utils.layerwise_calib import LayerActivationCollector
 from .custom import CUSTOM_MODEL_PLUGINS, _ParallelLinear
-from .gated_delta_net import GatedDeltaNetStateQuantMixin
+from .gdn import GatedDeltaNetStateQuantMixin
 
 try:
     from megatron.core.extensions.transformer_engine import (
