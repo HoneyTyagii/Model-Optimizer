@@ -19,4 +19,6 @@ from .config import *
 from .decode import *
 from .decode_prefill import *
 from .kda import *
+from .matmul import *
 from .prefill import *
+from .solve import *
